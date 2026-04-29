@@ -377,7 +377,7 @@ function scan(matrix, options) {
                         topLeftFinderPattern: location_1.topLeft,
                         bottomLeftFinderPattern: location_1.bottomLeft,
                         bottomRightAlignmentPattern: location_1.alignmentPattern,
-                    } });
+                    }, dimension: location_1.dimension });
             }
             else {
                 res = {
@@ -385,6 +385,7 @@ function scan(matrix, options) {
                     data: decoded.text,
                     chunks: decoded.chunks,
                     version: decoded.version,
+                    dimension: location_1.dimension,
                     managementCode: decoded.managementCode,
                     managementCode32: decoded.managementCode32,
                     managementFlags16: decoded.managementFlags16,
@@ -10359,1012 +10360,974 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
 /******/ ])["default"];
 });
 
-// ============================================================
-// Inlined: dm-decoder.js (Data Matrix ECC200 decoder)
-// ------------------------------------------------------------
-// Data Matrix (ECC200) decoder, paired with dm.js encoder.
-// 対応仕様:
-//  - ECC200 正方シンボル (10×10 〜 144×144)
-//  - Base256 モード + ASCII モード (0-127 + upper shift)
-//  - Reed-Solomon 誤り訂正 (α^1..α^n 根, 多項式 0x12D)
-//  - Management 32bit + 拡張管理部 (location48 / municipality24 含む) の抽出
-//  - XORマスク（ユーザ暗号化）逆適用
-//  - QR Matrix 画像内の DM サンプリング（QR 4 コーナーからの透視変換）
-//  - 単独 DM 画像からのサンプリング
-//
-// API (global.dmdecode):
-//  - decodeFromImage(imageData, qrLoc, NQR, opts) — 画像 + QR 検出情報から DM を復号
-//  - decodeFromMatrix(mat) — bool[N][N] → codewords → データ
-//  - applyXorMask(codewords, mask) — XOR マスク逆適用
-// ============================================================
-(function(global) {
-  'use strict';
+// QR Matrix reader extension.
+// This block is intentionally outside the webpack bundle so the existing QR
+// decoder stays untouched. It decodes the Data Matrix layer used by
+// QR Matrix Generator.html/dm.js: ECC200 square symbols, Base256 payload,
+// 32-bit management bytes, extension bytes, and optional final-codeword XOR.
+(function(root) {
+    "use strict";
 
-  // ===== DM シンボル表 (dm.js と同一) =====
-  const DM_SYMBOLS = [
-    { size:10, data:3,    ecc:5,   blocks:1, regions:[1,1], mapping:8   },
-    { size:12, data:5,    ecc:7,   blocks:1, regions:[1,1], mapping:10  },
-    { size:14, data:8,    ecc:10,  blocks:1, regions:[1,1], mapping:12  },
-    { size:16, data:12,   ecc:12,  blocks:1, regions:[1,1], mapping:14  },
-    { size:18, data:18,   ecc:14,  blocks:1, regions:[1,1], mapping:16  },
-    { size:20, data:22,   ecc:18,  blocks:1, regions:[1,1], mapping:18  },
-    { size:22, data:30,   ecc:20,  blocks:1, regions:[1,1], mapping:20  },
-    { size:24, data:36,   ecc:24,  blocks:1, regions:[1,1], mapping:22  },
-    { size:26, data:44,   ecc:28,  blocks:1, regions:[1,1], mapping:24  },
-    { size:32, data:62,   ecc:36,  blocks:1, regions:[2,2], mapping:28  },
-    { size:36, data:86,   ecc:42,  blocks:1, regions:[2,2], mapping:32  },
-    { size:40, data:114,  ecc:48,  blocks:1, regions:[2,2], mapping:36  },
-    { size:44, data:144,  ecc:56,  blocks:1, regions:[2,2], mapping:40  },
-    { size:48, data:174,  ecc:68,  blocks:1, regions:[2,2], mapping:44  },
-    { size:52, data:204,  ecc:84,  blocks:2, regions:[2,2], mapping:48  },
-    { size:64, data:280,  ecc:112, blocks:2, regions:[4,4], mapping:56  },
-    { size:72, data:368,  ecc:144, blocks:4, regions:[4,4], mapping:64  },
-    { size:80, data:456,  ecc:192, blocks:4, regions:[4,4], mapping:72  },
-    { size:88, data:576,  ecc:224, blocks:4, regions:[4,4], mapping:80  },
-    { size:96, data:696,  ecc:272, blocks:4, regions:[4,4], mapping:88  },
-    { size:104,data:816,  ecc:336, blocks:6, regions:[4,4], mapping:96  },
-    { size:120,data:1050, ecc:408, blocks:6, regions:[6,6], mapping:108 },
-    { size:132,data:1304, ecc:496, blocks:8, regions:[6,6], mapping:120 },
-    { size:144,data:1558, ecc:620, blocks:10,regions:[6,6], mapping:132 }
-  ];
-
-  function getSymbolBySize(size) {
-    for (const s of DM_SYMBOLS) if (s.size === size) return s;
-    return null;
-  }
-
-  // ===== GF(256) — dm.js と同じ多項式 0x12D =====
-  const DM_PRIM = 0x12D;
-  const gfExp = new Uint8Array(512);
-  const gfLog = new Uint8Array(256);
-  (function initGF() {
-    let x = 1;
-    for (let i = 0; i < 255; i++) {
-      gfExp[i] = x;
-      gfLog[x] = i;
-      x <<= 1;
-      if (x & 0x100) x ^= DM_PRIM;
+    var api = null;
+    if (typeof module !== "undefined" && module.exports) {
+        api = module.exports.default || module.exports;
+    } else if (root && root.jsQR) {
+        api = root.jsQR.default || root.jsQR;
     }
-    for (let i = 255; i < 512; i++) gfExp[i] = gfExp[i - 255];
-  })();
-  function gfMul(a, b) { return (!a || !b) ? 0 : gfExp[gfLog[a] + gfLog[b]]; }
-  function gfDiv(a, b) {
-    if (!a) return 0;
-    if (!b) throw new Error('division by zero');
-    return gfExp[(gfLog[a] + 255 - gfLog[b]) % 255];
-  }
-  function gfPow(a, p) {
-    if (!a) return 0;
-    let q = (gfLog[a] * p) % 255;
-    if (q < 0) q += 255;
-    return gfExp[q];
-  }
-  function gfInv(a) { return gfExp[(255 - gfLog[a]) % 255]; }
-  function gfPolyEval(poly, x) {
-    let y = poly[0];
-    for (let i = 1; i < poly.length; i++) y = gfMul(y, x) ^ poly[i];
-    return y;
-  }
-  function gfPolyMul(a, b) {
-    const res = new Array(a.length + b.length - 1).fill(0);
-    for (let i = 0; i < a.length; i++) {
-      if (!a[i]) continue;
-      for (let j = 0; j < b.length; j++) {
-        res[i + j] ^= gfMul(a[i], b[j]);
-      }
-    }
-    return res;
-  }
-  function gfPolyAdd(a, b) {
-    const la = a.length, lb = b.length;
-    const len = Math.max(la, lb);
-    const res = new Array(len).fill(0);
-    for (let i = 0; i < la; i++) res[len - la + i] = a[i];
-    for (let i = 0; i < lb; i++) res[len - lb + i] ^= b[i];
-    return res;
-  }
+    if (!api || api.decodeQRMatrix) return;
 
-  // ===== Reed-Solomon 復号 =====
-  function rsDecode(msgIn, eccLen) {
-    const msg = msgIn.slice(0);
-    const synd = new Array(eccLen).fill(0);
-    let hasError = false;
-    for (let j = 0; j < eccLen; j++) {
-      synd[j] = gfPolyEval(msg, gfExp[j + 1]);
-      if (synd[j]) hasError = true;
-    }
-    if (!hasError) return { codewords: msg, errors: 0 };
-    let sigma = [1];
-    let prev = [1];
-    let L = 0;
-    let b = 1;
-    let m = 1;
-    for (let n = 0; n < eccLen; n++) {
-      let delta = synd[n];
-      for (let i = 1; i <= L; i++) {
-        delta ^= gfMul(sigma[sigma.length - 1 - i], synd[n - i]);
-      }
-      if (delta === 0) {
-        m++;
-      } else if (2 * L <= n) {
-        const tmp = sigma.slice();
-        const factor = gfDiv(delta, b);
-        const shift = new Array(m).fill(0);
-        const scaled = prev.map(c => gfMul(c, factor));
-        const sub = scaled.concat(shift);
-        sigma = gfPolyAdd(sigma, sub);
-        L = n + 1 - L;
-        prev = tmp;
-        b = delta;
-        m = 1;
-      } else {
-        const factor = gfDiv(delta, b);
-        const shift = new Array(m).fill(0);
-        const scaled = prev.map(c => gfMul(c, factor));
-        const sub = scaled.concat(shift);
-        sigma = gfPolyAdd(sigma, sub);
-        m++;
-      }
-    }
-    const errPositions = [];
-    for (let i = 0; i < msg.length; i++) {
-      const xInv = gfExp[(255 - i) % 255];
-      if (gfPolyEval(sigma, xInv) === 0) errPositions.push(i);
-    }
-    if (errPositions.length !== L) {
-      throw new Error('RS: 誤り位置数が不一致 (L=' + L + ', found=' + errPositions.length + ')');
-    }
-    const S = synd.slice().reverse();
-    const prod = gfPolyMul(sigma, S);
-    const omega = prod.slice(Math.max(0, prod.length - eccLen));
-    const sigmaPrime = [];
-    for (let i = sigma.length - 2; i >= 0; i -= 2) {
-      sigmaPrime.unshift(sigma[i]);
-      sigmaPrime.unshift(0);
-    }
-    sigmaPrime.pop();
-    for (const pos of errPositions) {
-      const xInv = gfExp[(255 - pos) % 255];
-      const num = gfPolyEval(omega, xInv);
-      let sp = 0;
-      for (let i = 1; i < sigma.length; i += 2) {
-        sp ^= gfMul(sigma[sigma.length - 1 - i], gfPow(xInv, i - 1));
-      }
-      if (sp === 0) throw new Error('RS: sigma prime が 0');
-      const errVal = gfMul(num, gfInv(sp));
-      msg[msg.length - 1 - pos] ^= errVal;
-    }
-    for (let j = 0; j < eccLen; j++) {
-      if (gfPolyEval(msg, gfExp[j + 1]) !== 0) {
-        throw new Error('RS: 訂正後もシンドロームが残る');
-      }
-    }
-    return { codewords: msg, errors: errPositions.length };
-  }
-
-  // ===== Utah placement — 逆方向 =====
-  function extractCodewordsFromMapping(mapping) {
-    const nrow = mapping.length;
-    const ncol = mapping[0].length;
-    const visited = [];
-    for (let r = 0; r < nrow; r++) visited.push(new Uint8Array(ncol));
-
-    const codewords = [];
-
-    function readModule(row, col) {
-      let r = row, c = col;
-      if (r < 0) { r += nrow; c += 4 - ((nrow + 4) % 8); }
-      if (c < 0) { c += ncol; r += 4 - ((ncol + 4) % 8); }
-      if (r >= nrow || c >= ncol) return 0;
-      visited[r][c] = 1;
-      return mapping[r][c] ? 1 : 0;
-    }
-
-    function readUtah(row, col) {
-      let byte = 0;
-      for (let i = 0; i < 8; i++) {
-        let dr, dc;
-        switch (i) {
-          case 0: dr = row - 2; dc = col - 2; break;
-          case 1: dr = row - 2; dc = col - 1; break;
-          case 2: dr = row - 1; dc = col - 2; break;
-          case 3: dr = row - 1; dc = col - 1; break;
-          case 4: dr = row - 1; dc = col    ; break;
-          case 5: dr = row    ; dc = col - 2; break;
-          case 6: dr = row    ; dc = col - 1; break;
-          case 7: dr = row    ; dc = col    ; break;
-        }
-        const bit = readModule(dr, dc);
-        byte = (byte << 1) | bit;
-      }
-      return byte;
-    }
-
-    function readCorner1() {
-      let b = 0;
-      const pos = [[nrow-1,0],[nrow-1,1],[nrow-1,2],[0,ncol-2],[0,ncol-1],[1,ncol-1],[2,ncol-1],[3,ncol-1]];
-      for (const [r,c] of pos) { visited[r][c] = 1; b = (b << 1) | (mapping[r][c] ? 1 : 0); }
-      return b;
-    }
-    function readCorner2() {
-      let b = 0;
-      const pos = [[nrow-3,0],[nrow-2,0],[nrow-1,0],[0,ncol-4],[0,ncol-3],[0,ncol-2],[0,ncol-1],[1,ncol-1]];
-      for (const [r,c] of pos) { visited[r][c] = 1; b = (b << 1) | (mapping[r][c] ? 1 : 0); }
-      return b;
-    }
-    function readCorner3() {
-      let b = 0;
-      const pos = [[nrow-3,0],[nrow-2,0],[nrow-1,0],[0,ncol-2],[0,ncol-1],[1,ncol-1],[2,ncol-1],[3,ncol-1]];
-      for (const [r,c] of pos) { visited[r][c] = 1; b = (b << 1) | (mapping[r][c] ? 1 : 0); }
-      return b;
-    }
-    function readCorner4() {
-      let b = 0;
-      const pos = [[nrow-1,0],[nrow-1,ncol-1],[0,ncol-3],[0,ncol-2],[0,ncol-1],[1,ncol-3],[1,ncol-2],[1,ncol-1]];
-      for (const [r,c] of pos) { visited[r][c] = 1; b = (b << 1) | (mapping[r][c] ? 1 : 0); }
-      return b;
-    }
-
-    let row = 4;
-    let col = 0;
-    do {
-      if (row === nrow && col === 0) codewords.push(readCorner1());
-      else if (row === nrow - 2 && col === 0 && ncol % 4 !== 0) codewords.push(readCorner2());
-      else if (row === nrow - 2 && col === 0 && ncol % 8 === 4) codewords.push(readCorner3());
-      else if (row === nrow + 4 && col === 2 && ncol % 8 === 0) codewords.push(readCorner4());
-      do {
-        if (row < nrow && col >= 0 && !visited[row][col]) codewords.push(readUtah(row, col));
-        row -= 2; col += 2;
-      } while (row >= 0 && col < ncol);
-      row += 1; col += 3;
-      do {
-        if (row >= 0 && col < ncol && !visited[row][col]) codewords.push(readUtah(row, col));
-        row += 2; col -= 2;
-      } while (row < nrow && col >= 0);
-      row += 3; col += 1;
-    } while (row < nrow || col < ncol);
-
-    return codewords;
-  }
-
-  function extractMappingFromCells(cells, symbol) {
-    const { size, regions, mapping: mappingSize } = symbol;
-    const [rRows, rCols] = regions;
-    const regionDataRows = mappingSize / rRows;
-    const regionDataCols = mappingSize / rCols;
-
-    const mapping = [];
-    for (let r = 0; r < mappingSize; r++) mapping.push(new Array(mappingSize).fill(false));
-
-    for (let ri = 0; ri < rRows; ri++) {
-      for (let ci = 0; ci < rCols; ci++) {
-        const r0 = ri * (regionDataRows + 2);
-        const c0 = ci * (regionDataCols + 2);
-        for (let dr = 0; dr < regionDataRows; dr++) {
-          for (let dc = 0; dc < regionDataCols; dc++) {
-            const mr = ri * regionDataRows + dr;
-            const mc = ci * regionDataCols + dc;
-            mapping[mr][mc] = !!cells[r0 + 1 + dr][c0 + 1 + dc];
-          }
-        }
-      }
-    }
-    return mapping;
-  }
-
-  function deinterleaveAndCorrect(finalCw, symbol) {
-    const { data: dataCap, ecc: eccCap, blocks } = symbol;
-    const eccPerBlock = eccCap / blocks;
-    const dataBlocks = [];
-    const eccBlocks = [];
-    for (let b = 0; b < blocks; b++) {
-      dataBlocks.push([]);
-      eccBlocks.push([]);
-    }
-    if (blocks === 1) {
-      for (let i = 0; i < dataCap; i++) dataBlocks[0].push(finalCw[i] || 0);
-      for (let i = 0; i < eccPerBlock; i++) eccBlocks[0].push(finalCw[dataCap + i] || 0);
-    } else {
-      const lens = [];
-      for (let b = 0; b < blocks; b++) {
-        let n = 0;
-        for (let i = b; i < dataCap; i += blocks) n++;
-        lens.push(n);
-      }
-      const maxLen = Math.max(...lens);
-      let ptr = 0;
-      for (let i = 0; i < maxLen; i++) {
-        for (let b = 0; b < blocks; b++) {
-          if (i < lens[b]) dataBlocks[b].push(finalCw[ptr++] || 0);
-        }
-      }
-      for (let i = 0; i < eccPerBlock; i++) {
-        for (let b = 0; b < blocks; b++) eccBlocks[b].push(finalCw[ptr++] || 0);
-      }
-    }
-    let totalErrors = 0;
-    let failedBlocks = 0;
-    const correctedDataBlocks = [];
-    for (let b = 0; b < blocks; b++) {
-      const combined = dataBlocks[b].concat(eccBlocks[b]);
-      try {
-        const res = rsDecode(combined, eccPerBlock);
-        totalErrors += res.errors;
-        correctedDataBlocks.push(res.codewords.slice(0, dataBlocks[b].length));
-      } catch (e) {
-        failedBlocks++;
-        correctedDataBlocks.push(dataBlocks[b]);
-      }
-    }
-    const dataCw = new Array(dataCap).fill(0);
-    for (let b = 0; b < blocks; b++) {
-      let idx = b;
-      for (let j = 0; j < correctedDataBlocks[b].length; j++) {
-        if (idx < dataCap) dataCw[idx] = correctedDataBlocks[b][j];
-        idx += blocks;
-      }
-    }
-    return { dataCw, errors: totalErrors, failedBlocks };
-  }
-
-  function applyXorMask(finalCw, mask) {
-    if (!mask || mask.length === 0) return finalCw.slice();
-    const out = new Array(finalCw.length);
-    for (let i = 0; i < finalCw.length; i++) out[i] = finalCw[i] ^ mask[i % mask.length];
-    return out;
-  }
-
-  function b256Unpseudo(byte, pos) {
-    const pr = (149 * pos) % 255 + 1;
-    let t = byte - pr;
-    while (t < 0) t += 256;
-    return t & 0xFF;
-  }
-
-  function decodeBase256(dataCodewords, startIdx) {
-    if (dataCodewords[startIdx] !== 231) return null;
-    let pos = startIdx + 1;
-    let len;
-    const lenByte = b256Unpseudo(dataCodewords[pos], pos + 1);
-    if (lenByte === 0) {
-      len = -1;
-    } else if (lenByte <= 249) {
-      len = lenByte;
-      pos += 1;
-    } else {
-      const lenByte2 = b256Unpseudo(dataCodewords[pos + 1], pos + 2);
-      len = (lenByte - 249) * 250 + lenByte2;
-      pos += 2;
-    }
-    const bytes = [];
-    if (len < 0) {
-      while (pos < dataCodewords.length) {
-        bytes.push(b256Unpseudo(dataCodewords[pos], pos + 1));
-        pos++;
-      }
-    } else {
-      for (let i = 0; i < len; i++) {
-        if (pos >= dataCodewords.length) break;
-        bytes.push(b256Unpseudo(dataCodewords[pos], pos + 1));
-        pos++;
-      }
-    }
-    return { bytes: new Uint8Array(bytes), nextIdx: pos };
-  }
-
-  function decodeASCIISegment(dataCodewords, startIdx, endIdx) {
-    const bytes = [];
-    let i = startIdx;
-    while (i < endIdx) {
-      const c = dataCodewords[i];
-      if (c >= 1 && c <= 128) { bytes.push(c - 1); i++; }
-      else if (c === 235 && i + 1 < endIdx) { bytes.push(dataCodewords[i + 1] - 1 + 128); i += 2; }
-      else if (c === 129) break;
-      else i++;
-    }
-    return { bytes: new Uint8Array(bytes), nextIdx: i };
-  }
-
-  function bytesToString(bytes) {
-    try {
-      if (typeof TextDecoder !== 'undefined') {
-        return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
-      }
-    } catch (e) {}
-    let s = '';
-    for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-    return s;
-  }
-
-  function isExpectedPadByte(byte, onePosIndex) {
-    const R = ((149 * onePosIndex) % 253) + 1;
-    let pad = 129 + R;
-    if (pad > 254) pad -= 254;
-    return (byte & 0xFF) === (pad & 0xFF);
-  }
-
-  function parseDataStream(dataCodewords) {
-    let i = 0;
-    let dataBytes = new Uint8Array(0);
-    let dataEncoding = 'none';
-    if (dataCodewords[0] === 231) {
-      const r = decodeBase256(dataCodewords, 0);
-      if (r) {
-        dataBytes = r.bytes;
-        i = r.nextIdx;
-        dataEncoding = 'Base256';
-      }
-    } else if (dataCodewords[0] !== 129 && dataCodewords[0] !== undefined) {
-      let end = dataCodewords.length;
-      for (let k = 0; k < dataCodewords.length; k++) {
-        if (dataCodewords[k] === 129) { end = k; break; }
-      }
-      const r = decodeASCIISegment(dataCodewords, 0, end);
-      dataBytes = r.bytes;
-      i = end;
-      dataEncoding = 'ASCII';
-    }
-
-    let firstDelim = -1;
-    if (i < dataCodewords.length && dataCodewords[i] === 129) {
-      firstDelim = i;
-      i++;
-    } else {
-      for (let k = i; k < dataCodewords.length; k++) {
-        if (dataCodewords[k] === 129) { firstDelim = k; i = k + 1; break; }
-      }
-    }
-
-    let mgmt32 = null;
-    if (i + 3 < dataCodewords.length) {
-      mgmt32 = ((dataCodewords[i] << 24) |
-                (dataCodewords[i+1] << 16) |
-                (dataCodewords[i+2] << 8) |
-                dataCodewords[i+3]) >>> 0;
-      i += 4;
-    }
-
-    let secondDelim = -1;
-    for (let k = i; k < dataCodewords.length; k++) {
-      if (dataCodewords[k] !== 129) continue;
-      let valid = true;
-      let checked = 0;
-      for (let p = k + 1; p < dataCodewords.length && checked < 3; p++, checked++) {
-        const pos = p + 1;
-        if (!isExpectedPadByte(dataCodewords[p], pos)) { valid = false; break; }
-      }
-      if (valid || k === dataCodewords.length - 1) {
-        secondDelim = k;
-        break;
-      }
-    }
-
-    const extStart = i;
-    const extEnd = (secondDelim >= 0) ? secondDelim : dataCodewords.length;
-    const extBytes = new Uint8Array(dataCodewords.slice(extStart, extEnd));
-
-    return {
-      data: bytesToString(dataBytes),
-      dataBytes,
-      dataEncoding,
-      managementCode32: mgmt32,
-      extBytes,
-      firstDelimIndex: firstDelim,
-      secondDelimIndex: secondDelim
-    };
-  }
-
-  function parseExtBlocks(extBytes, mgmt32) {
-    const out = {
-      creationDateTimeExt32: null,
-      expiryExt32: null,
-      readerIdExt32: null,
-      managementExt32: null,
-      locationLatExt24: null,
-      locationLonExt24: null,
-      municipalityExt24: null
-    };
-    if (mgmt32 === null || mgmt32 === undefined) return out;
-
-    const flags = mgmt32 & 0xFFFF;
-
-    let p = 0;
-    const readU32 = () => {
-      if (p + 4 > extBytes.length) return null;
-      const v = ((extBytes[p] << 24) | (extBytes[p+1] << 16) | (extBytes[p+2] << 8) | extBytes[p+3]) >>> 0;
-      p += 4;
-      return v;
-    };
-    const readU24 = () => {
-      if (p + 3 > extBytes.length) return null;
-      const v = ((extBytes[p] << 16) | (extBytes[p+1] << 8) | extBytes[p+2]) >>> 0;
-      p += 3;
-      return v;
-    };
-
-    if (flags & 0x0200) out.creationDateTimeExt32 = readU32();
-    if (flags & 0x0100) out.expiryExt32 = readU32();
-    if (flags & 0x0080) out.readerIdExt32 = readU32();
-    if (flags & 0x0040) out.managementExt32 = readU32();
-    if (flags & 0x0020) {
-      out.locationLatExt24 = readU24();
-      out.locationLonExt24 = readU24();
-    }
-    if (flags & 0x0010) out.municipalityExt24 = readU24();
-
-    return out;
-  }
-
-  function decodeFromMatrix(mat, opts) {
-    opts = opts || {};
-    const N = mat.length;
-    if (N === 0 || mat[0].length !== N) throw new Error('DM: 非正方行列');
-    const symbol = getSymbolBySize(N);
-    if (!symbol) throw new Error('DM: 未対応シンボルサイズ ' + N);
-
-    const mapping = extractMappingFromCells(mat, symbol);
-    const finalCwArr = extractCodewordsFromMapping(mapping);
-    const finalCwLen = symbol.data + symbol.ecc;
-    const finalCw = finalCwArr.slice(0, finalCwLen);
-    const unmasked = opts.xorMask ? applyXorMask(finalCw, opts.xorMask) : finalCw.slice();
-    const { dataCw, errors, failedBlocks } = deinterleaveAndCorrect(unmasked, symbol);
-    let parsed, ext;
-    try {
-      parsed = parseDataStream(dataCw);
-      ext = parseExtBlocks(parsed.extBytes, parsed.managementCode32);
-    } catch (e) {
-      parsed = { data: null, dataBytes: new Uint8Array(), dataEncoding: null,
-                 managementCode32: 0, extBytes: new Uint8Array() };
-      ext = {};
-    }
-
-    return {
-      size: N,
-      symbol,
-      codewords: unmasked,
-      dataCodewords: dataCw,
-      rsErrors: errors,
-      rsFailedBlocks: failedBlocks,
-      data: parsed.data,
-      dataBytes: parsed.dataBytes,
-      dataEncoding: parsed.dataEncoding,
-      managementCode32: parsed.managementCode32,
-      extBytes: parsed.extBytes,
-      ...ext
-    };
-  }
-
-  function perspectiveTransform(src, dst) {
-    const a = [];
-    const b = [];
-    for (let i = 0; i < 4; i++) {
-      const [sx, sy] = src[i];
-      const [dx, dy] = dst[i];
-      a.push([sx, sy, 1, 0, 0, 0, -dx * sx, -dx * sy]); b.push(dx);
-      a.push([0, 0, 0, sx, sy, 1, -dy * sx, -dy * sy]); b.push(dy);
-    }
-    const n = 8;
-    for (let i = 0; i < n; i++) {
-      let piv = i;
-      for (let k = i + 1; k < n; k++) if (Math.abs(a[k][i]) > Math.abs(a[piv][i])) piv = k;
-      if (piv !== i) { [a[i], a[piv]] = [a[piv], a[i]]; [b[i], b[piv]] = [b[piv], b[i]]; }
-      const d = a[i][i];
-      if (Math.abs(d) < 1e-12) throw new Error('透視変換: 特異行列');
-      for (let j = i; j < n; j++) a[i][j] /= d;
-      b[i] /= d;
-      for (let k = 0; k < n; k++) {
-        if (k === i) continue;
-        const f = a[k][i];
-        if (!f) continue;
-        for (let j = i; j < n; j++) a[k][j] -= f * a[i][j];
-        b[k] -= f * b[i];
-      }
-    }
-    return [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], 1];
-  }
-
-  function applyTransform(H, x, y) {
-    const w = H[6] * x + H[7] * y + H[8];
-    return [
-      (H[0] * x + H[1] * y + H[2]) / w,
-      (H[3] * x + H[4] * y + H[5]) / w
+    var DM_SYMBOLS = [
+        { size:10, data:3, ecc:5, blocks:1, regions:[1,1], mapping:8 },
+        { size:12, data:5, ecc:7, blocks:1, regions:[1,1], mapping:10 },
+        { size:14, data:8, ecc:10, blocks:1, regions:[1,1], mapping:12 },
+        { size:16, data:12, ecc:12, blocks:1, regions:[1,1], mapping:14 },
+        { size:18, data:18, ecc:14, blocks:1, regions:[1,1], mapping:16 },
+        { size:20, data:22, ecc:18, blocks:1, regions:[1,1], mapping:18 },
+        { size:22, data:30, ecc:20, blocks:1, regions:[1,1], mapping:20 },
+        { size:24, data:36, ecc:24, blocks:1, regions:[1,1], mapping:22 },
+        { size:26, data:44, ecc:28, blocks:1, regions:[1,1], mapping:24 },
+        { size:32, data:62, ecc:36, blocks:1, regions:[2,2], mapping:28 },
+        { size:36, data:86, ecc:42, blocks:1, regions:[2,2], mapping:32 },
+        { size:40, data:114, ecc:48, blocks:1, regions:[2,2], mapping:36 },
+        { size:44, data:144, ecc:56, blocks:1, regions:[2,2], mapping:40 },
+        { size:48, data:174, ecc:68, blocks:1, regions:[2,2], mapping:44 },
+        { size:52, data:204, ecc:84, blocks:2, regions:[2,2], mapping:48 },
+        { size:64, data:280, ecc:112, blocks:2, regions:[4,4], mapping:56 },
+        { size:72, data:368, ecc:144, blocks:4, regions:[4,4], mapping:64 },
+        { size:80, data:456, ecc:192, blocks:4, regions:[4,4], mapping:72 },
+        { size:88, data:576, ecc:224, blocks:4, regions:[4,4], mapping:80 },
+        { size:96, data:696, ecc:272, blocks:4, regions:[4,4], mapping:88 },
+        { size:104, data:816, ecc:336, blocks:6, regions:[4,4], mapping:96 },
+        { size:120, data:1050, ecc:408, blocks:6, regions:[6,6], mapping:108 },
+        { size:132, data:1304, ecc:496, blocks:8, regions:[6,6], mapping:120 },
+        { size:144, data:1558, ecc:620, blocks:10, regions:[6,6], mapping:132 }
     ];
-  }
 
-  function luma(imageData, x, y) {
-    const { width, height, data } = imageData;
-    const ix = Math.round(x), iy = Math.round(y);
-    if (ix < 0 || ix >= width || iy < 0 || iy >= height) return 255;
-    const o = (iy * width + ix) * 4;
-    return (data[o] * 299 + data[o+1] * 587 + data[o+2] * 114) / 1000;
-  }
-
-  function computeThreshold(imageData, samples) {
-    const { width, height, data } = imageData;
-    samples = samples || 2000;
-    let sum = 0, cnt = 0;
-    for (let i = 0; i < samples; i++) {
-      const x = Math.floor(Math.random() * width);
-      const y = Math.floor(Math.random() * height);
-      const o = (y * width + x) * 4;
-      sum += (data[o] * 299 + data[o+1] * 587 + data[o+2] * 114) / 1000;
-      cnt++;
-    }
-    return sum / cnt;
-  }
-
-  function buildQRTransform(qrLocation, NQR) {
-    const {
-      topLeftFinderPattern: TL,
-      topRightFinderPattern: TR,
-      bottomLeftFinderPattern: BL,
-      topLeftCorner, topRightCorner, bottomRightCorner, bottomLeftCorner
-    } = qrLocation;
-
-    if (TL && TR && BL) {
-      const a = (TR.x - TL.x) / (NQR - 7);
-      const b = (BL.x - TL.x) / (NQR - 7);
-      const c = TL.x - a * 3.5 - b * 3.5;
-      const d = (TR.y - TL.y) / (NQR - 7);
-      const e = (BL.y - TL.y) / (NQR - 7);
-      const f = TL.y - d * 3.5 - e * 3.5;
-      const mapCell = (u, v) => [a * u + b * v + c, d * u + e * v + f];
-      const src = [[0, 0], [NQR, 0], [NQR, NQR], [0, NQR]];
-      const dst = [ mapCell(0, 0), mapCell(NQR, 0), mapCell(NQR, NQR), mapCell(0, NQR) ];
-      return perspectiveTransform(src, dst);
-    }
-
-    const src = [[0, 0], [NQR, 0], [NQR, NQR], [0, NQR]];
-    const dst = [
-      [topLeftCorner.x, topLeftCorner.y],
-      [topRightCorner.x, topRightCorner.y],
-      [bottomRightCorner.x, bottomRightCorner.y],
-      [bottomLeftCorner.x, bottomLeftCorner.y]
-    ];
-    return perspectiveTransform(src, dst);
-  }
-
-  function scoreNDM(imageData, H, NQR, NDM, threshold) {
-    const dmOrigin = NQR - NDM + 1.5;
-    const sampleDark = (cx, cy) => {
-      const [px, py] = applyTransform(H, cx, cy);
-      return luma(imageData, px, py) < threshold;
-    };
-
-    let tMatch = 0, tTotal = 0;
-    for (let dc = 1; dc < NDM - 1; dc++) {
-      const dark = sampleDark(dmOrigin + dc + 0.5, dmOrigin + 0.5);
-      if (dark === (dc % 2 === 1)) tMatch++;
-      tTotal++;
-    }
-    for (let dr = 1; dr < NDM - 1; dr++) {
-      const dark = sampleDark(dmOrigin + 0.5, dmOrigin + dr + 0.5);
-      if (dark === (dr % 2 === 1)) tMatch++;
-      tTotal++;
-    }
-    let lMatch = 0, lTotal = 0;
-    for (let dc = 0; dc < NDM; dc++) {
-      const dark = sampleDark(dmOrigin + dc + 0.5, dmOrigin + (NDM - 1) + 0.5);
-      if (dark) lMatch++;
-      lTotal++;
-    }
-    for (let dr = 0; dr < NDM - 1; dr++) {
-      const dark = sampleDark(dmOrigin + (NDM - 1) + 0.5, dmOrigin + dr + 0.5);
-      if (dark) lMatch++;
-      lTotal++;
-    }
-    let dAll = 0, tAll = 0;
-    for (let dr = 1; dr < NDM - 1; dr++) {
-      for (let dc = 1; dc < NDM - 1; dc++) {
-        if (sampleDark(dmOrigin + dc + 0.5, dmOrigin + dr + 0.5)) dAll++;
-        tAll++;
-      }
-    }
-    const dRate = dAll / Math.max(1, tAll);
-
-    const tScore = tTotal > 0 ? tMatch / tTotal : 0.5;
-    const lScore = lTotal > 0 ? lMatch / lTotal : 0.5;
-    const dScoreDist = 1 - Math.abs(dRate - 0.5) * 2;
-    return lScore * 0.5 + tScore * 0.35 + dScoreDist * 0.15;
-  }
-
-  function detectNDM(imageData, qrLocation, NQR, opts) {
-    opts = opts || {};
-    const threshold = opts.threshold || computeThreshold(imageData);
-    const H = buildQRTransform(qrLocation, NQR);
-    const candidates = DM_SYMBOLS.map(s => s.size).filter(n => n <= NQR - 8);
-    let bestScore = -1, bestN = -1;
-    for (const n of candidates) {
-      const s = scoreNDM(imageData, H, NQR, n, threshold);
-      if (s > bestScore) { bestScore = s; bestN = n; }
-    }
-    return { NDM: bestN, score: bestScore, threshold, H };
-  }
-
-  function sampleDMMatrix(imageData, H, NQR, NDM, threshold) {
-    const dmOrigin = NQR - NDM + 1.5;
-    const dmRot = [];
-    for (let dr = 0; dr < NDM; dr++) {
-      const row = new Array(NDM);
-      for (let dc = 0; dc < NDM; dc++) {
-        const cx = dmOrigin + dc + 0.5;
-        const cy = dmOrigin + dr + 0.5;
-        const [px, py] = applyTransform(H, cx, cy);
-        row[dc] = luma(imageData, px, py) < threshold;
-      }
-      dmRot.push(row);
-    }
-    return dmRot;
-  }
-
-  function rotateDMCW(dmRot) {
-    const N = dmRot.length;
-    const out = [];
-    for (let r = 0; r < N; r++) {
-      const row = new Array(N);
-      for (let c = 0; c < N; c++) row[c] = dmRot[N - 1 - c][r];
-      out.push(row);
-    }
-    return out;
-  }
-
-  function decodeFromImage(imageData, qrLocation, NQR, opts) {
-    opts = opts || {};
-    const det = detectNDM(imageData, qrLocation, NQR, opts);
-    if (det.NDM < 0) throw new Error('DM サイズの推定に失敗しました');
-    const dmRot = sampleDMMatrix(imageData, det.H, NQR, det.NDM, det.threshold);
-    const dmOrig = rotateDMCW(dmRot);
-    const result = decodeFromMatrix(dmOrig, opts);
-    result.NDM = det.NDM;
-    result.detectScore = det.score;
-    result.threshold = det.threshold;
-    return result;
-  }
-
-  const dmdecode = {
-    decodeFromImage,
-    decodeFromMatrix,
-    detectNDM,
-    sampleDMMatrix,
-    rotateDMCW,
-    extractMappingFromCells,
-    extractCodewordsFromMapping,
-    deinterleaveAndCorrect,
-    applyXorMask,
-    rsDecode,
-    parseDataStream,
-    parseExtBlocks,
-    decodeBase256,
-    bytesToString,
-    buildQRTransform,
-    applyTransform,
-    perspectiveTransform,
-    DM_SYMBOLS,
-    getSymbolBySize
-  };
-
-  global.dmdecode = dmdecode;
-})(typeof window !== 'undefined' ? window : (typeof global !== 'undefined' ? global : this));
-
-// ============================================================
-// QR Matrix extension: decodeQRMatrix / decodeDataMatrixFromQuad
-// ------------------------------------------------------------
-// jsQR 本体の webpack バンドル末尾に追加する、QR Matrix モード専用アダプタ。
-// dmdecode (dm-decoder.js) と連携し、QR finder 検出結果からその内側に重ねられた
-// Data Matrix を復号する。
-//
-// decodeQRMatrix(data, width, height, qrCandidate, opts):
-//   - qrCandidate: jsQR が返した検出結果 (location + dimension または version)
-//   - opts.appEncMask: ユーザ暗号化のマスク (Uint8Array / number[])
-//   - opts.minFinderScore: DM L-finder スコアしきい値 (既定 0.55)
-//   - 戻り値:
-//       成功: { text, data, managementCode32, ..., symbolSize, finderScore,
-//               rsFailedBlocks, rsErrors, codewords, dataBytes }
-//       失敗 (RS 不可): { isRaw: true, finderScore, symbolSize,
-//                         rsFailedBlocks, rsErrors, codewords }
-//       スコア不足 / 例外: null
-//
-// decodeDataMatrixFromQuad(data, width, height, quad, opts):
-//   - quad: DM 外周 4 コーナー (左上→右上→右下→左下) のピクセル座標 [{x,y}...]
-//   - NDM は quad の辺長を候補サイズに丸めて推定
-// ============================================================
-(function (scope) {
-    var globalObj = scope || (typeof window !== 'undefined' ? window : (typeof self !== 'undefined' ? self : globalThis));
-    // Node (CommonJS): module.exports はこの時点で jsQR 関数そのもの
-    var nodeJsQR = (typeof module !== 'undefined' && module.exports && typeof module.exports === 'function')
-        ? module.exports : null;
-    var browserJsQR = (globalObj && typeof globalObj.jsQR === 'function') ? globalObj.jsQR : null;
-    var jsQRFn = browserJsQR || nodeJsQR;
-    if (!jsQRFn) return;
-
-    function getDmDecode() {
-        if (globalObj && globalObj.dmdecode) return globalObj.dmdecode;
-        if (typeof dmdecode !== 'undefined') return dmdecode;
-        return null;
-    }
-
-    function ensureLocationFrom(qrCandidate) {
-        if (!qrCandidate) return null;
-        if (qrCandidate.location) return qrCandidate.location;
-        if (qrCandidate.topLeftFinderPattern && qrCandidate.topRightFinderPattern && qrCandidate.bottomLeftFinderPattern) {
-            return qrCandidate;
+    function getSymbolBySize(size) {
+        for (var i = 0; i < DM_SYMBOLS.length; i++) {
+            if (DM_SYMBOLS[i].size === size) return DM_SYMBOLS[i];
         }
         return null;
     }
 
-    function qrDimensionFrom(qrCandidate) {
-        if (!qrCandidate) return 0;
-        if (typeof qrCandidate.dimension === 'number' && qrCandidate.dimension >= 21) return qrCandidate.dimension;
-        if (qrCandidate.version && typeof qrCandidate.version.versionNumber === 'number') {
-            return 17 + 4 * qrCandidate.version.versionNumber;
-        }
-        return 0;
+    function clamp(v, lo, hi) {
+        return v < lo ? lo : (v > hi ? hi : v);
     }
 
-    function wrapDecodedDM(decoded, NQR, minScore) {
-        if (!decoded) return null;
-        var score = decoded.detectScore;
-        if (typeof score !== 'number') score = 0;
-        if (score < minScore) return null;
-        var base = {
-            finderScore: score,
-            symbolSize: decoded.NDM || decoded.size,
-            rsFailedBlocks: decoded.rsFailedBlocks || 0,
-            rsErrors: decoded.rsErrors || 0,
-            codewords: decoded.codewords,
-            dataBytes: decoded.dataBytes,
-            managementCode32: decoded.managementCode32,
-            managementFlags16: decoded.managementFlags16,
-            managementExt32: decoded.managementExt32,
-            expiryExt32: decoded.expiryExt32,
-            readerIdExt32: decoded.readerIdExt32,
-            creationDateTimeExt32: decoded.creationDateTimeExt32,
-            locationLatExt24: decoded.locationLatExt24,
-            locationLonExt24: decoded.locationLonExt24,
-            municipalityExt24: decoded.municipalityExt24,
-            NDM: decoded.NDM,
-            NQR: NQR,
+    function utf8Decode(bytes) {
+        try {
+            if (typeof TextDecoder !== "undefined") {
+                return new TextDecoder("utf-8", { fatal: false }).decode(new Uint8Array(bytes));
+            }
+        } catch (e) {}
+        var s = "";
+        for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+        try {
+            return decodeURIComponent(escape(s));
+        } catch (e2) {
+            return s;
+        }
+    }
+
+    function dmBase256Unpseudo(codeword, pos) {
+        var pr = (149 * pos) % 255 + 1;
+        var value = codeword - pr;
+        if (value < 0) value += 256;
+        return value & 0xFF;
+    }
+
+    function parseDMDataCodewords(dataCodewords) {
+        var idx = 0;
+        var payloadBytes = [];
+
+        if (dataCodewords[idx] === 231) {
+            if (idx + 1 >= dataCodewords.length) return null;
+            var lenFirst = dmBase256Unpseudo(dataCodewords[idx + 1], idx + 2);
+            var payloadLen;
+            if (lenFirst <= 249) {
+                payloadLen = lenFirst;
+                idx += 2;
+            } else {
+                if (idx + 2 >= dataCodewords.length) return null;
+                var lenSecond = dmBase256Unpseudo(dataCodewords[idx + 2], idx + 3);
+                payloadLen = (lenFirst - 249) * 250 + lenSecond;
+                idx += 3;
+            }
+            if (idx + payloadLen > dataCodewords.length) return null;
+            for (var i = 0; i < payloadLen; i++) {
+                payloadBytes.push(dmBase256Unpseudo(dataCodewords[idx + i], idx + i + 1));
+            }
+            idx += payloadLen;
+        } else {
+            while (idx < dataCodewords.length && dataCodewords[idx] !== 129) {
+                var cw = dataCodewords[idx++];
+                if (cw >= 1 && cw <= 128) payloadBytes.push(cw - 1);
+                else if (cw === 235 && idx < dataCodewords.length) payloadBytes.push((dataCodewords[idx++] - 1 + 128) & 0xFF);
+                else break;
+            }
+        }
+
+        if (idx < dataCodewords.length && dataCodewords[idx] === 129) idx++;
+
+        var result = {
+            bytes: payloadBytes,
+            text: utf8Decode(payloadBytes)
+        };
+
+        if (idx + 4 <= dataCodewords.length) {
+            var b0 = dataCodewords[idx] & 0xFF;
+            var b1 = dataCodewords[idx + 1] & 0xFF;
+            var b2 = dataCodewords[idx + 2] & 0xFF;
+            var b3 = dataCodewords[idx + 3] & 0xFF;
+            var managementCode32 = (((b0 << 24) >>> 0) | (b1 << 16) | (b2 << 8) | b3) >>> 0;
+            result.managementCode32 = managementCode32;
+            result.managementCode = (managementCode32 >>> 16) & 0xFFFF;
+            result.managementFlags16 = managementCode32 & 0xFFFF;
+            idx += 4;
+
+            var flags = result.managementFlags16;
+            if ((flags & 0x0200) !== 0 && idx + 4 <= dataCodewords.length) {
+                result.creationDateTimeExt32 = readUint32BE(dataCodewords, idx); idx += 4;
+            }
+            if ((flags & 0x0100) !== 0 && idx + 4 <= dataCodewords.length) {
+                result.expiryExt32 = readUint32BE(dataCodewords, idx); idx += 4;
+            }
+            if ((flags & 0x0080) !== 0 && idx + 4 <= dataCodewords.length) {
+                result.readerIdExt32 = readUint32BE(dataCodewords, idx); idx += 4;
+            }
+            if ((flags & 0x0040) !== 0 && idx + 4 <= dataCodewords.length) {
+                result.managementExt32 = readUint32BE(dataCodewords, idx); idx += 4;
+            }
+            if ((flags & 0x0020) !== 0 && idx + 6 <= dataCodewords.length) {
+                result.locationLatExt24 = readUint24BE(dataCodewords, idx); idx += 3;
+                result.locationLonExt24 = readUint24BE(dataCodewords, idx); idx += 3;
+            }
+            if ((flags & 0x0010) !== 0 && idx + 3 <= dataCodewords.length) {
+                result.municipalityExt24 = readUint24BE(dataCodewords, idx); idx += 3;
+            }
+        }
+        return result;
+    }
+
+    function readUint32BE(arr, idx) {
+        return ((((arr[idx] & 0xFF) << 24) >>> 0) | ((arr[idx + 1] & 0xFF) << 16) | ((arr[idx + 2] & 0xFF) << 8) | (arr[idx + 3] & 0xFF)) >>> 0;
+    }
+
+    function readUint24BE(arr, idx) {
+        return (((arr[idx] & 0xFF) << 16) | ((arr[idx + 1] & 0xFF) << 8) | (arr[idx + 2] & 0xFF)) >>> 0;
+    }
+
+    function RSField(primitive, size, generatorBase) {
+        this.primitive = primitive;
+        this.size = size;
+        this.generatorBase = generatorBase;
+        this.expTable = new Array(size);
+        this.logTable = new Array(size);
+        var x = 1;
+        for (var i = 0; i < size; i++) {
+            this.expTable[i] = x;
+            x <<= 1;
+            if (x >= size) x = (x ^ primitive) & (size - 1);
+        }
+        for (var j = 0; j < size - 1; j++) this.logTable[this.expTable[j]] = j;
+        this.zero = new RSPoly(this, [0]);
+        this.one = new RSPoly(this, [1]);
+    }
+    RSField.prototype.multiply = function(a, b) {
+        if (a === 0 || b === 0) return 0;
+        return this.expTable[(this.logTable[a] + this.logTable[b]) % (this.size - 1)];
+    };
+    RSField.prototype.inverse = function(a) {
+        if (a === 0) throw new Error("Cannot invert zero");
+        return this.expTable[this.size - this.logTable[a] - 1];
+    };
+    RSField.prototype.buildMonomial = function(degree, coefficient) {
+        if (degree < 0) throw new Error("Invalid monomial degree");
+        if (coefficient === 0) return this.zero;
+        var coefficients = new Array(degree + 1).fill(0);
+        coefficients[0] = coefficient;
+        return new RSPoly(this, coefficients);
+    };
+    RSField.prototype.exp = function(a) {
+        return this.expTable[a];
+    };
+    RSField.prototype.log = function(a) {
+        if (a === 0) throw new Error("Cannot log zero");
+        return this.logTable[a];
+    };
+
+    function RSPoly(field, coefficients) {
+        if (!coefficients || coefficients.length === 0) throw new Error("No coefficients");
+        this.field = field;
+        var firstNonZero = 0;
+        while (firstNonZero < coefficients.length - 1 && coefficients[firstNonZero] === 0) firstNonZero++;
+        this.coefficients = coefficients.slice(firstNonZero);
+    }
+    RSPoly.prototype.degree = function() { return this.coefficients.length - 1; };
+    RSPoly.prototype.isZero = function() { return this.coefficients[0] === 0; };
+    RSPoly.prototype.getCoefficient = function(degree) {
+        return this.coefficients[this.coefficients.length - 1 - degree];
+    };
+    RSPoly.prototype.addOrSubtract = function(other) {
+        if (this.isZero()) return other;
+        if (other.isZero()) return this;
+        var smaller = this.coefficients;
+        var larger = other.coefficients;
+        if (smaller.length > larger.length) {
+            var tmp = smaller; smaller = larger; larger = tmp;
+        }
+        var sum = larger.slice(0);
+        var diff = larger.length - smaller.length;
+        for (var i = 0; i < smaller.length; i++) sum[i + diff] ^= smaller[i];
+        return new RSPoly(this.field, sum);
+    };
+    RSPoly.prototype.multiply = function(scalar) {
+        if (scalar === 0) return this.field.zero;
+        if (scalar === 1) return this;
+        var product = new Array(this.coefficients.length);
+        for (var i = 0; i < this.coefficients.length; i++) {
+            product[i] = this.field.multiply(this.coefficients[i], scalar);
+        }
+        return new RSPoly(this.field, product);
+    };
+    RSPoly.prototype.multiplyPoly = function(other) {
+        if (this.isZero() || other.isZero()) return this.field.zero;
+        var product = new Array(this.coefficients.length + other.coefficients.length - 1).fill(0);
+        for (var i = 0; i < this.coefficients.length; i++) {
+            for (var j = 0; j < other.coefficients.length; j++) {
+                product[i + j] ^= this.field.multiply(this.coefficients[i], other.coefficients[j]);
+            }
+        }
+        return new RSPoly(this.field, product);
+    };
+    RSPoly.prototype.multiplyByMonomial = function(degree, coefficient) {
+        if (degree < 0) throw new Error("Invalid degree");
+        if (coefficient === 0) return this.field.zero;
+        var product = new Array(this.coefficients.length + degree).fill(0);
+        for (var i = 0; i < this.coefficients.length; i++) {
+            product[i] = this.field.multiply(this.coefficients[i], coefficient);
+        }
+        return new RSPoly(this.field, product);
+    };
+    RSPoly.prototype.evaluateAt = function(a) {
+        var result = 0;
+        if (a === 0) return this.getCoefficient(0);
+        if (a === 1) {
+            for (var i = 0; i < this.coefficients.length; i++) result ^= this.coefficients[i];
+            return result;
+        }
+        result = this.coefficients[0];
+        for (var j = 1; j < this.coefficients.length; j++) {
+            result = this.field.multiply(a, result) ^ this.coefficients[j];
+        }
+        return result;
+    };
+
+    function rsRunEuclidean(field, a, b, R) {
+        if (a.degree() < b.degree()) {
+            var tmp = a; a = b; b = tmp;
+        }
+        var rLast = a;
+        var r = b;
+        var tLast = field.zero;
+        var t = field.one;
+        while (r.degree() >= R / 2) {
+            var rLastLast = rLast;
+            var tLastLast = tLast;
+            rLast = r;
+            tLast = t;
+            if (rLast.isZero()) return null;
+            r = rLastLast;
+            var q = field.zero;
+            var dltInverse = field.inverse(rLast.getCoefficient(rLast.degree()));
+            while (r.degree() >= rLast.degree() && !r.isZero()) {
+                var degreeDiff = r.degree() - rLast.degree();
+                var scale = field.multiply(r.getCoefficient(r.degree()), dltInverse);
+                q = q.addOrSubtract(field.buildMonomial(degreeDiff, scale));
+                r = r.addOrSubtract(rLast.multiplyByMonomial(degreeDiff, scale));
+            }
+            t = q.multiplyPoly(tLast).addOrSubtract(tLastLast);
+            if (r.degree() >= rLast.degree()) return null;
+        }
+        var sigmaTildeAtZero = t.getCoefficient(0);
+        if (sigmaTildeAtZero === 0) return null;
+        var inverse = field.inverse(sigmaTildeAtZero);
+        return [t.multiply(inverse), r.multiply(inverse)];
+    }
+
+    function rsFindErrorLocations(field, errorLocator) {
+        var numErrors = errorLocator.degree();
+        if (numErrors === 1) return [errorLocator.getCoefficient(1)];
+        var result = [];
+        for (var i = 1; i < field.size && result.length < numErrors; i++) {
+            if (errorLocator.evaluateAt(i) === 0) result.push(field.inverse(i));
+        }
+        return result.length === numErrors ? result : null;
+    }
+
+    function rsFindErrorMagnitudes(field, errorEvaluator, errorLocations) {
+        var result = new Array(errorLocations.length);
+        for (var i = 0; i < errorLocations.length; i++) {
+            var xiInverse = field.inverse(errorLocations[i]);
+            var denominator = 1;
+            for (var j = 0; j < errorLocations.length; j++) {
+                if (i !== j) denominator = field.multiply(denominator, 1 ^ field.multiply(errorLocations[j], xiInverse));
+            }
+            result[i] = field.multiply(errorEvaluator.evaluateAt(xiInverse), field.inverse(denominator));
+            if (field.generatorBase !== 0) result[i] = field.multiply(result[i], xiInverse);
+        }
+        return result;
+    }
+
+    var DM_RS_FIELD = new RSField(0x12D, 256, 1);
+
+    function rsDecodeBlock(bytes, eccLen) {
+        var output = bytes.slice(0);
+        var poly = new RSPoly(DM_RS_FIELD, output);
+        var syndromeCoefficients = new Array(eccLen).fill(0);
+        var error = false;
+        for (var s = 0; s < eccLen; s++) {
+            var evaluation = poly.evaluateAt(DM_RS_FIELD.exp(s + DM_RS_FIELD.generatorBase));
+            syndromeCoefficients[syndromeCoefficients.length - 1 - s] = evaluation;
+            if (evaluation !== 0) error = true;
+        }
+        if (!error) return output;
+        var syndrome = new RSPoly(DM_RS_FIELD, syndromeCoefficients);
+        var sigmaOmega = rsRunEuclidean(DM_RS_FIELD, DM_RS_FIELD.buildMonomial(eccLen, 1), syndrome, eccLen);
+        if (sigmaOmega === null) return null;
+        var errorLocations = rsFindErrorLocations(DM_RS_FIELD, sigmaOmega[0]);
+        if (!errorLocations) return null;
+        var errorMagnitudes = rsFindErrorMagnitudes(DM_RS_FIELD, sigmaOmega[1], errorLocations);
+        for (var i = 0; i < errorLocations.length; i++) {
+            var position = output.length - 1 - DM_RS_FIELD.log(errorLocations[i]);
+            if (position < 0) return null;
+            output[position] ^= errorMagnitudes[i];
+        }
+        return output;
+    }
+
+    function dmReadModule(array, nrow, ncol, row, col) {
+        var r = row, c = col;
+        if (r < 0) { r += nrow; c += 4 - ((nrow + 4) % 8); }
+        if (c < 0) { c += ncol; r += 4 - ((ncol + 4) % 8); }
+        if (r < 0 || r >= nrow || c < 0 || c >= ncol) return 0;
+        return array[r][c] ? 1 : 0;
+    }
+
+    function dmReadUtah(array, nrow, ncol, row, col) {
+        var coords = [
+            [row - 2, col - 2], [row - 2, col - 1],
+            [row - 1, col - 2], [row - 1, col - 1], [row - 1, col],
+            [row, col - 2], [row, col - 1], [row, col]
+        ];
+        var byte = 0;
+        for (var i = 0; i < coords.length; i++) {
+            byte = (byte << 1) | dmReadModule(array, nrow, ncol, coords[i][0], coords[i][1]);
+        }
+        return byte & 0xFF;
+    }
+
+    function dmReadDirectBits(array, coords) {
+        var byte = 0;
+        for (var i = 0; i < coords.length; i++) {
+            var r = coords[i][0], c = coords[i][1];
+            byte = (byte << 1) | ((array[r] && array[r][c]) ? 1 : 0);
+        }
+        return byte & 0xFF;
+    }
+
+    function dmReadCorner1(array, nrow, ncol) {
+        return dmReadDirectBits(array, [[nrow - 1,0],[nrow - 1,1],[nrow - 1,2],[0,ncol - 2],[0,ncol - 1],[1,ncol - 1],[2,ncol - 1],[3,ncol - 1]]);
+    }
+    function dmReadCorner2(array, nrow, ncol) {
+        return dmReadDirectBits(array, [[nrow - 3,0],[nrow - 2,0],[nrow - 1,0],[0,ncol - 4],[0,ncol - 3],[0,ncol - 2],[0,ncol - 1],[1,ncol - 1]]);
+    }
+    function dmReadCorner3(array, nrow, ncol) {
+        return dmReadDirectBits(array, [[nrow - 3,0],[nrow - 2,0],[nrow - 1,0],[0,ncol - 2],[0,ncol - 1],[1,ncol - 1],[2,ncol - 1],[3,ncol - 1]]);
+    }
+    function dmReadCorner4(array, nrow, ncol) {
+        return dmReadDirectBits(array, [[nrow - 1,0],[nrow - 1,ncol - 1],[0,ncol - 3],[0,ncol - 2],[0,ncol - 1],[1,ncol - 3],[1,ncol - 2],[1,ncol - 1]]);
+    }
+
+    function dmReadCodewordsFromMapping(mapping, nrow, ncol, totalCodewords) {
+        var codewords = [];
+        var row = 4;
+        var col = 0;
+        do {
+            if (row === nrow && col === 0) {
+                codewords.push(dmReadCorner1(mapping, nrow, ncol));
+            } else if (row === nrow - 2 && col === 0 && ncol % 4 !== 0) {
+                codewords.push(dmReadCorner2(mapping, nrow, ncol));
+            } else if (row === nrow - 2 && col === 0 && ncol % 8 === 4) {
+                codewords.push(dmReadCorner3(mapping, nrow, ncol));
+            } else if (row === nrow + 4 && col === 2 && ncol % 8 === 0) {
+                codewords.push(dmReadCorner4(mapping, nrow, ncol));
+            }
+            do {
+                if (row < nrow && col >= 0) codewords.push(dmReadUtah(mapping, nrow, ncol, row, col));
+                row -= 2;
+                col += 2;
+            } while (row >= 0 && col < ncol);
+            row += 1;
+            col += 3;
+            do {
+                if (row >= 0 && col < ncol) codewords.push(dmReadUtah(mapping, nrow, ncol, row, col));
+                row += 2;
+                col -= 2;
+            } while (row < nrow && col >= 0);
+            row += 3;
+            col += 1;
+        } while (row < nrow || col < ncol);
+        return codewords.slice(0, totalCodewords);
+    }
+
+    function extractMappingCells(cells, symbol) {
+        var size = symbol.size;
+        var regions = symbol.regions;
+        var rRows = regions[0], rCols = regions[1];
+        var regionDataRows = symbol.mapping / rRows;
+        var regionDataCols = symbol.mapping / rCols;
+        var mapping = [];
+        for (var r = 0; r < symbol.mapping; r++) mapping[r] = new Array(symbol.mapping).fill(0);
+        for (var ri = 0; ri < rRows; ri++) {
+            for (var ci = 0; ci < rCols; ci++) {
+                var r0 = ri * (regionDataRows + 2);
+                var c0 = ci * (regionDataCols + 2);
+                for (var dr = 0; dr < regionDataRows; dr++) {
+                    for (var dc = 0; dc < regionDataCols; dc++) {
+                        var mr = ri * regionDataRows + dr;
+                        var mc = ci * regionDataCols + dc;
+                        var sr = r0 + 1 + dr;
+                        var sc = c0 + 1 + dc;
+                        mapping[mr][mc] = (sr >= 0 && sr < size && sc >= 0 && sc < size && cells[sr][sc]) ? 1 : 0;
+                    }
+                }
+            }
+        }
+        return mapping;
+    }
+
+    function scoreDataMatrixFinder(cells, symbolOrSize) {
+        var symbol = typeof symbolOrSize === "number" ? getSymbolBySize(symbolOrSize) : symbolOrSize;
+        if (!symbol || !cells || cells.length !== symbol.size) return 0;
+        var regions = symbol.regions;
+        var rRows = regions[0], rCols = regions[1];
+        var regionDataRows = symbol.mapping / rRows;
+        var regionDataCols = symbol.mapping / rCols;
+        var total = 0, matched = 0;
+        function test(r, c, expected) {
+            if (r < 0 || r >= symbol.size || c < 0 || c >= symbol.size) return;
+            total++;
+            if (((cells[r][c] ? 1 : 0) === expected)) matched++;
+        }
+        for (var ri = 0; ri < rRows; ri++) {
+            for (var ci = 0; ci < rCols; ci++) {
+                var r0 = ri * (regionDataRows + 2);
+                var c0 = ci * (regionDataCols + 2);
+                for (var c = 0; c < regionDataCols + 2; c++) {
+                    test(r0, c0 + c, (c % 2 === 0) ? 1 : 0);
+                    test(r0 + regionDataRows + 1, c0 + c, 1);
+                }
+                for (var r = 0; r < regionDataRows + 2; r++) {
+                    test(r0 + r, c0, 1);
+                    test(r0 + r, c0 + regionDataCols + 1, ((regionDataRows + 1 - r) % 2 === 0) ? 1 : 0);
+                }
+            }
+        }
+        return total ? matched / total : 0;
+    }
+
+    function applyXorMask(codewords, mask) {
+        if (!mask || !mask.length) return codewords.slice(0);
+        var out = codewords.slice(0);
+        for (var i = 0; i < out.length; i++) out[i] = (out[i] ^ mask[i % mask.length]) & 0xFF;
+        return out;
+    }
+
+    function correctDataMatrixCodewords(finalCodewords, symbol) {
+        var dataCap = symbol.data;
+        var eccCap = symbol.ecc;
+        var blocks = symbol.blocks;
+        var eccPerBlock = eccCap / blocks;
+        var dataCodewords = new Array(dataCap);
+        var correctedBlocks = [];
+
+        if (blocks === 1) {
+            var corrected = rsDecodeBlock(finalCodewords.slice(0, dataCap + eccCap), eccPerBlock);
+            if (!corrected) return null;
+            return {
+                dataCodewords: corrected.slice(0, dataCap),
+                correctedFinalCodewords: corrected.slice(0, dataCap + eccCap)
+            };
+        }
+
+        var blockDataLens = [];
+        var maxDataLen = 0;
+        for (var b = 0; b < blocks; b++) {
+            var len = 0;
+            for (var i = b; i < dataCap; i += blocks) len++;
+            blockDataLens[b] = len;
+            if (len > maxDataLen) maxDataLen = len;
+        }
+
+        var offset = 0;
+        var blockArrays = [];
+        for (var bb = 0; bb < blocks; bb++) blockArrays[bb] = [];
+        for (var pos = 0; pos < maxDataLen; pos++) {
+            for (var b2 = 0; b2 < blocks; b2++) {
+                if (pos < blockDataLens[b2]) blockArrays[b2].push(finalCodewords[offset++] || 0);
+            }
+        }
+        for (var e = 0; e < eccPerBlock; e++) {
+            for (var b3 = 0; b3 < blocks; b3++) blockArrays[b3].push(finalCodewords[offset++] || 0);
+        }
+
+        for (var b4 = 0; b4 < blocks; b4++) {
+            var correctedBlock = rsDecodeBlock(blockArrays[b4], eccPerBlock);
+            if (!correctedBlock) return null;
+            correctedBlocks[b4] = correctedBlock;
+            for (var d = 0; d < blockDataLens[b4]; d++) {
+                dataCodewords[b4 + d * blocks] = correctedBlock[d];
+            }
+        }
+
+        var correctedFinal = [];
+        for (var p = 0; p < maxDataLen; p++) {
+            for (var b5 = 0; b5 < blocks; b5++) {
+                if (p < blockDataLens[b5]) correctedFinal.push(correctedBlocks[b5][p]);
+            }
+        }
+        for (var ep = 0; ep < eccPerBlock; ep++) {
+            for (var b6 = 0; b6 < blocks; b6++) {
+                correctedFinal.push(correctedBlocks[b6][blockDataLens[b6] + ep]);
+            }
+        }
+        return {
+            dataCodewords: dataCodewords,
+            correctedFinalCodewords: correctedFinal
+        };
+    }
+
+    function normalizeCells(cells) {
+        var n = cells.length;
+        var out = [];
+        for (var r = 0; r < n; r++) {
+            out[r] = [];
+            for (var c = 0; c < n; c++) out[r][c] = cells[r][c] ? 1 : 0;
+        }
+        return out;
+    }
+
+    function invertCells(cells) {
+        var n = cells.length;
+        var out = [];
+        for (var r = 0; r < n; r++) {
+            out[r] = [];
+            for (var c = 0; c < n; c++) out[r][c] = cells[r][c] ? 0 : 1;
+        }
+        return out;
+    }
+
+    function rotateCellsCW(cells) {
+        var n = cells.length;
+        var out = [];
+        for (var r = 0; r < n; r++) {
+            out[r] = [];
+            for (var c = 0; c < n; c++) out[r][c] = cells[n - 1 - c][r] ? 1 : 0;
+        }
+        return out;
+    }
+
+    function decodeDataMatrixCells(cells, options) {
+        options = options || {};
+        if (!cells || !cells.length || cells.length !== cells[0].length) return null;
+        var symbol = getSymbolBySize(cells.length);
+        if (!symbol) return null;
+        var base = normalizeCells(cells);
+        var bestVariant = null;
+        var rotated = base;
+        for (var rot = 0; rot < 4; rot++) {
+            var normal = rotated;
+            var inverted = invertCells(normal);
+            var scoreNormal = scoreDataMatrixFinder(normal, symbol);
+            var scoreInverted = scoreDataMatrixFinder(inverted, symbol);
+            if (!bestVariant || scoreNormal > bestVariant.score) {
+                bestVariant = { cells: normal, score: scoreNormal, rotation: rot, inverted: false };
+            }
+            if (!bestVariant || scoreInverted > bestVariant.score) {
+                bestVariant = { cells: inverted, score: scoreInverted, rotation: rot, inverted: true };
+            }
+            rotated = rotateCellsCW(rotated);
+        }
+        var workCells = bestVariant.cells;
+        var finderScore = bestVariant.score;
+        if (options.minFinderScore && finderScore < options.minFinderScore) {
+            return { isRaw: true, finderScore: finderScore, symbolSize: symbol.size };
+        }
+
+        var mapping = extractMappingCells(workCells, symbol);
+        var rawCodewords = dmReadCodewordsFromMapping(mapping, symbol.mapping, symbol.mapping, symbol.data + symbol.ecc);
+        if (rawCodewords.length < symbol.data + symbol.ecc) {
+            return { isRaw: true, finderScore: finderScore, symbolSize: symbol.size, codewords: rawCodewords };
+        }
+
+        var unmaskedCodewords = applyXorMask(rawCodewords, options.appEncMask);
+        var corrected = correctDataMatrixCodewords(unmaskedCodewords, symbol);
+        if (!corrected) {
+            return {
+                isRaw: true,
+                finderScore: finderScore,
+                symbolSize: symbol.size,
+                codewords: unmaskedCodewords,
+                rawCodewords: rawCodewords
+            };
+        }
+
+        var parsed = parseDMDataCodewords(corrected.dataCodewords);
+        if (!parsed) {
+            return {
+                isRaw: true,
+                finderScore: finderScore,
+                symbolSize: symbol.size,
+                codewords: corrected.correctedFinalCodewords,
+                dataBytes: corrected.dataCodewords
+            };
+        }
+
+        return {
+            binaryData: parsed.bytes,
+            data: parsed.text,
+            text: parsed.text,
+            chunks: [{ type: "byte", bytes: parsed.bytes, text: parsed.text }],
+            managementCode: parsed.managementCode,
+            managementCode32: parsed.managementCode32,
+            managementFlags16: parsed.managementFlags16,
+            creationDateTimeExt32: parsed.creationDateTimeExt32,
+            managementExt32: parsed.managementExt32,
+            expiryExt32: parsed.expiryExt32,
+            readerIdExt32: parsed.readerIdExt32,
+            locationLatExt24: parsed.locationLatExt24,
+            locationLonExt24: parsed.locationLonExt24,
+            municipalityExt24: parsed.municipalityExt24,
+            codewords: corrected.correctedFinalCodewords,
+            dataBytes: corrected.dataCodewords,
+            symbolSize: symbol.size,
+            finderScore: finderScore,
+            rotation: bestVariant.rotation,
+            inverted: bestVariant.inverted,
             isDataMatrix: true
         };
-        // RS 訂正不可 or データ未復号 → isRaw を返し、上位で暗号化検出に使う
-        if ((decoded.rsFailedBlocks || 0) > 0 || decoded.data === null || decoded.data === undefined) {
-            base.isRaw = true;
-            return base;
-        }
-        base.text = decoded.data;
-        base.data = decoded.data;
-        return base;
     }
 
-    function decodeQRMatrix(data, width, height, qrCandidate, opts) {
-        opts = opts || {};
-        var dmd = getDmDecode();
-        if (!dmd || !dmd.decodeFromImage) return null;
-        var location = ensureLocationFrom(qrCandidate);
-        if (!location) return null;
-        var NQR = qrDimensionFrom(qrCandidate);
-        if (!NQR) return null;
-        var imageData = { data: data, width: width, height: height };
-        var minScore = (typeof opts.minFinderScore === 'number') ? opts.minFinderScore : 0.55;
-        var decodeOpts = {};
-        if (opts.appEncMask && opts.appEncMask.length) {
-            decodeOpts.xorMask = opts.appEncMask instanceof Uint8Array
-                ? opts.appEncMask
-                : Uint8Array.from(opts.appEncMask);
-        }
-        var decoded;
-        try {
-            decoded = dmd.decodeFromImage(imageData, location, NQR, decodeOpts);
-        } catch (e) {
-            return null;
-        }
-        return wrapDecodedDM(decoded, NQR, minScore);
+    function getQrDimension(qr) {
+        if (!qr) return null;
+        if (qr.dimension) return qr.dimension;
+        var v = qr.version;
+        if (typeof v === "number") return 17 + 4 * v;
+        if (v && typeof v.versionNumber === "number") return 17 + 4 * v.versionNumber;
+        if (v && typeof v.dimension === "number") return v.dimension;
+        return null;
     }
 
-    // quad = [{x,y} TL, TR, BR, BL]
-    function decodeDataMatrixFromQuad(data, width, height, quad, opts) {
-        opts = opts || {};
-        var dmd = getDmDecode();
-        if (!dmd || !dmd.perspectiveTransform || !dmd.sampleDMMatrix || !dmd.decodeFromMatrix) return null;
-        if (!quad || quad.length !== 4) return null;
-        var imageData = { data: data, width: width, height: height };
-        var minScore = (typeof opts.minFinderScore === 'number') ? opts.minFinderScore : 0.55;
+    function makeAffineProjectorFromFinders(location, dimension) {
+        if (!location || !location.topLeftFinderPattern || !location.topRightFinderPattern || !location.bottomLeftFinderPattern) return null;
+        var tl = location.topLeftFinderPattern;
+        var tr = location.topRightFinderPattern;
+        var bl = location.bottomLeftFinderPattern;
+        var span = dimension - 7;
+        if (span <= 0) return null;
+        var ax = (tr.x - tl.x) / span;
+        var ay = (tr.y - tl.y) / span;
+        var bx = (bl.x - tl.x) / span;
+        var by = (bl.y - tl.y) / span;
+        var cx = tl.x - ax * 3.5 - bx * 3.5;
+        var cy = tl.y - ay * 3.5 - by * 3.5;
+        return function(u, v) {
+            return { x: cx + ax * u + bx * v, y: cy + ay * u + by * v };
+        };
+    }
 
-        function dist(a, b) {
-            var dx = a.x - b.x, dy = a.y - b.y;
-            return Math.sqrt(dx * dx + dy * dy);
+    function squareToQuad(p1, p2, p3, p4) {
+        var dx3 = p1.x - p2.x + p3.x - p4.x;
+        var dy3 = p1.y - p2.y + p3.y - p4.y;
+        if (dx3 === 0 && dy3 === 0) {
+            return {
+                a11: p2.x - p1.x, a12: p2.y - p1.y, a13: 0,
+                a21: p3.x - p2.x, a22: p3.y - p2.y, a23: 0,
+                a31: p1.x, a32: p1.y, a33: 1
+            };
         }
-        // 辺長からモジュール数を推定 → 最寄りの標準サイズへ丸め
-        var sizes = dmd.DM_SYMBOLS.map(function (s) { return s.size; });
-        var avgPx = (dist(quad[0], quad[1]) + dist(quad[1], quad[2]) +
-                     dist(quad[2], quad[3]) + dist(quad[3], quad[0])) / 4;
+        var dx1 = p2.x - p3.x;
+        var dx2 = p4.x - p3.x;
+        var dy1 = p2.y - p3.y;
+        var dy2 = p4.y - p3.y;
+        var denominator = dx1 * dy2 - dx2 * dy1;
+        if (Math.abs(denominator) < 1e-6) return null;
+        var a13 = (dx3 * dy2 - dx2 * dy3) / denominator;
+        var a23 = (dx1 * dy3 - dx3 * dy1) / denominator;
+        return {
+            a11: p2.x - p1.x + a13 * p2.x,
+            a12: p2.y - p1.y + a13 * p2.y,
+            a13: a13,
+            a21: p4.x - p1.x + a23 * p4.x,
+            a22: p4.y - p1.y + a23 * p4.y,
+            a23: a23,
+            a31: p1.x,
+            a32: p1.y,
+            a33: 1
+        };
+    }
 
-        // マスク (オプション)
-        var decodeOpts = {};
-        if (opts.appEncMask && opts.appEncMask.length) {
-            decodeOpts.xorMask = opts.appEncMask instanceof Uint8Array
-                ? opts.appEncMask
-                : Uint8Array.from(opts.appEncMask);
+    function makeCornerProjector(location, dimension) {
+        if (!location || !location.topLeftCorner || !location.topRightCorner || !location.bottomRightCorner || !location.bottomLeftCorner) return null;
+        var t = squareToQuad(location.topLeftCorner, location.topRightCorner, location.bottomRightCorner, location.bottomLeftCorner);
+        if (!t) return null;
+        return function(u, v) {
+            var x = u / dimension;
+            var y = v / dimension;
+            var d = t.a13 * x + t.a23 * y + t.a33;
+            return {
+                x: (t.a11 * x + t.a21 * y + t.a31) / d,
+                y: (t.a12 * x + t.a22 * y + t.a32) / d
+            };
+        };
+    }
+
+    function makeQRProjector(qr, dimension) {
+        var finderProjector = makeAffineProjectorFromFinders(qr && qr.location, dimension);
+        if (finderProjector) return finderProjector;
+        return makeCornerProjector(qr && qr.location, dimension);
+    }
+
+    function lumaAt(data, width, height, x, y) {
+        var px = clamp(Math.round(x), 0, width - 1);
+        var py = clamp(Math.round(y), 0, height - 1);
+        var idx;
+        if (data.length === width * height) {
+            return data[py * width + px];
+        }
+        idx = (py * width + px) * 4;
+        return (data[idx] * 54 + data[idx + 1] * 183 + data[idx + 2] * 19) >> 8;
+    }
+
+    function median5(a, b, c, d, e) {
+        var arr = [a, b, c, d, e].sort(function(x, y) { return x - y; });
+        return arr[2];
+    }
+
+    function sampleModuleLuma(data, width, height, project, u, v) {
+        var p0 = project(u, v);
+        var p1 = project(u + 0.18, v);
+        var p2 = project(u - 0.18, v);
+        var p3 = project(u, v + 0.18);
+        var p4 = project(u, v - 0.18);
+        return median5(
+            lumaAt(data, width, height, p0.x, p0.y),
+            lumaAt(data, width, height, p1.x, p1.y),
+            lumaAt(data, width, height, p2.x, p2.y),
+            lumaAt(data, width, height, p3.x, p3.y),
+            lumaAt(data, width, height, p4.x, p4.y)
+        );
+    }
+
+    function thresholdForValues(values) {
+        if (!values.length) return 128;
+        var sorted = values.slice(0).sort(function(a, b) { return a - b; });
+        var n = Math.max(1, Math.floor(sorted.length * 0.18));
+        var low = 0, high = 0;
+        for (var i = 0; i < n; i++) {
+            low += sorted[i];
+            high += sorted[sorted.length - 1 - i];
+        }
+        low /= n;
+        high /= n;
+        if (high - low < 18) return 128;
+        return (low + high) / 2;
+    }
+
+    function orderQuadPoints(points) {
+        if (!points || points.length < 4) return null;
+        var pts = points.slice(0, 4).map(function(p) { return { x: Number(p.x), y: Number(p.y) }; });
+        pts.sort(function(a, b) { return (a.x + a.y) - (b.x + b.y); });
+        var tl = pts[0];
+        var br = pts[3];
+        var mid = [pts[1], pts[2]].sort(function(a, b) { return (a.x - a.y) - (b.x - b.y); });
+        var bl = mid[0];
+        var tr = mid[1];
+        return [tl, tr, br, bl];
+    }
+
+    function makeQuadProjector(quad) {
+        var ordered = orderQuadPoints(quad);
+        if (!ordered) return null;
+        var t = squareToQuad(ordered[0], ordered[1], ordered[2], ordered[3]);
+        if (!t) return null;
+        return function(x, y) {
+            var d = t.a13 * x + t.a23 * y + t.a33;
+            return {
+                x: (t.a11 * x + t.a21 * y + t.a31) / d,
+                y: (t.a12 * x + t.a22 * y + t.a32) / d
+            };
+        };
+    }
+
+    function sampleNormalizedModuleLuma(data, width, height, project, x, y, step) {
+        var p0 = project(x, y);
+        var p1 = project(x + step, y);
+        var p2 = project(x - step, y);
+        var p3 = project(x, y + step);
+        var p4 = project(x, y - step);
+        return median5(
+            lumaAt(data, width, height, p0.x, p0.y),
+            lumaAt(data, width, height, p1.x, p1.y),
+            lumaAt(data, width, height, p2.x, p2.y),
+            lumaAt(data, width, height, p3.x, p3.y),
+            lumaAt(data, width, height, p4.x, p4.y)
+        );
+    }
+
+    function sampleDataMatrixFromQuad(imageData, width, height, quad, dmSize, pad) {
+        var project = makeQuadProjector(quad);
+        if (!project) return null;
+        var values = [];
+        var cells = [];
+        var span = 1 - pad * 2;
+        var step = Math.max(0.001, 0.18 * span / dmSize);
+        for (var r = 0; r < dmSize; r++) {
+            cells[r] = [];
+            for (var c = 0; c < dmSize; c++) {
+                var x = pad + (c + 0.5) * span / dmSize;
+                var y = pad + (r + 0.5) * span / dmSize;
+                var lum = sampleNormalizedModuleLuma(imageData, width, height, project, x, y, step);
+                cells[r][c] = lum;
+                values.push(lum);
+            }
+        }
+        var threshold = thresholdForValues(values);
+        var bits = [];
+        for (var rr = 0; rr < dmSize; rr++) {
+            bits[rr] = [];
+            for (var cc = 0; cc < dmSize; cc++) bits[rr][cc] = cells[rr][cc] < threshold ? 1 : 0;
+        }
+        return { cells: bits, threshold: threshold, pad: pad };
+    }
+
+    function decodeDataMatrixFromQuad(imageData, width, height, quad, options) {
+        options = options || {};
+        var sizes = [];
+        if (options.dmSize && getSymbolBySize(options.dmSize)) {
+            sizes = [options.dmSize];
+        } else {
+            for (var si = 0; si < DM_SYMBOLS.length; si++) sizes.push(DM_SYMBOLS[si].size);
+        }
+        var pads = options.pads || [0, 0.025, 0.05, 0.075, 0.10, -0.015];
+        var bestRaw = null;
+        for (var pi = 0; pi < pads.length; pi++) {
+            for (var i = 0; i < sizes.length; i++) {
+                var sample = sampleDataMatrixFromQuad(imageData, width, height, quad, sizes[i], pads[pi]);
+                if (!sample) continue;
+                var decoded = decodeDataMatrixCells(sample.cells, {
+                    appEncMask: options.appEncMask,
+                    minFinderScore: options.minFinderScore || 0.60
+                });
+                if (!decoded) continue;
+                decoded.sample = { threshold: sample.threshold, pad: sample.pad, source: "quad" };
+                if (!decoded.isRaw) return decoded;
+                if (!bestRaw || (decoded.finderScore || 0) > (bestRaw.finderScore || 0)) bestRaw = decoded;
+            }
+        }
+        return bestRaw;
+    }
+
+    function sampleQRMatrixDataMatrix(imageData, width, height, qr, dmSize) {
+        var nqr = getQrDimension(qr);
+        if (!nqr) return null;
+        var project = makeQRProjector(qr, nqr);
+        if (!project) return null;
+        var dmOrigin = nqr - dmSize + 1.5;
+        var displayValues = [];
+        var values = [];
+        for (var dr = 0; dr < dmSize; dr++) {
+            displayValues[dr] = [];
+            for (var dc = 0; dc < dmSize; dc++) {
+                var u = dmOrigin + dc + 0.5;
+                var v = dmOrigin + dr + 0.5;
+                var lum = sampleModuleLuma(imageData, width, height, project, u, v);
+                displayValues[dr][dc] = lum;
+                values.push(lum);
+            }
+        }
+        var threshold = thresholdForValues(values);
+        var displayCells = [];
+        for (var r = 0; r < dmSize; r++) {
+            displayCells[r] = [];
+            for (var c = 0; c < dmSize; c++) displayCells[r][c] = displayValues[r][c] < threshold ? 1 : 0;
         }
 
-        // quad→DM セル変換 (0..N → ピクセル)。DM サイズ候補を順に試して最良スコアを選ぶ
-        var bestResult = null;
-        var bestScore = -1;
+        var originalCells = [];
+        for (var or = 0; or < dmSize; or++) {
+            originalCells[or] = [];
+            for (var oc = 0; oc < dmSize; oc++) {
+                originalCells[or][oc] = displayCells[dmSize - 1 - oc][or] ? 1 : 0;
+            }
+        }
+        return {
+            cells: originalCells,
+            threshold: threshold,
+            qrDimension: nqr,
+            dmOrigin: dmOrigin
+        };
+    }
+
+    function candidateDMSizesForQR(qr, options) {
+        var nqr = getQrDimension(qr);
+        if (!nqr) return [];
+        var forced = options && options.dmSize;
+        if (forced) return getSymbolBySize(forced) ? [forced] : [];
+        var sizes = [];
+        for (var i = 0; i < DM_SYMBOLS.length; i++) {
+            var size = DM_SYMBOLS[i].size;
+            if (size <= nqr - 8) sizes.push(size);
+        }
+        sizes.sort(function(a, b) { return b - a; });
+        return sizes;
+    }
+
+    function decodeQRMatrix(imageData, width, height, qr, options) {
+        options = options || {};
+        var sizes = candidateDMSizesForQR(qr, options);
+        var bestRaw = null;
         for (var i = 0; i < sizes.length; i++) {
-            var N = sizes[i];
-            // 透視変換: DM セル座標 (0..N, 0..N) を quad にマップ
-            var src = [[0, 0], [N, 0], [N, N], [0, N]];
-            var dst = [
-                [quad[0].x, quad[0].y],
-                [quad[1].x, quad[1].y],
-                [quad[2].x, quad[2].y],
-                [quad[3].x, quad[3].y]
-            ];
-            var H;
-            try { H = dmd.perspectiveTransform(src, dst); } catch (e) { continue; }
-            var threshold = 128;
-            // 簡易 L-finder スコア: 最下行 + 最右列が黒、最上行・最左列が timing (.#.#...)
-            var lMatch = 0, lTotal = 0, tMatch = 0, tTotal = 0;
-            function luma(xf, yf) {
-                var ix = Math.round(xf), iy = Math.round(yf);
-                if (ix < 0 || ix >= width || iy < 0 || iy >= height) return 255;
-                var o = (iy * width + ix) * 4;
-                return (data[o] * 299 + data[o + 1] * 587 + data[o + 2] * 114) / 1000;
-            }
-            function sampleDark(cx, cy) {
-                var p = dmd.applyTransform(H, cx, cy);
-                return luma(p[0], p[1]) < threshold;
-            }
-            for (var dc = 0; dc < N; dc++) {
-                if (sampleDark(dc + 0.5, N - 1 + 0.5)) lMatch++;
-                lTotal++;
-            }
-            for (var dr = 0; dr < N - 1; dr++) {
-                if (sampleDark(N - 1 + 0.5, dr + 0.5)) lMatch++;
-                lTotal++;
-            }
-            for (var dc2 = 0; dc2 < N; dc2++) {
-                if (sampleDark(dc2 + 0.5, 0.5) === (dc2 % 2 === 0)) tMatch++;
-                tTotal++;
-            }
-            for (var dr2 = 1; dr2 < N; dr2++) {
-                if (sampleDark(0.5, dr2 + 0.5) === (dr2 % 2 === 0)) tMatch++;
-                tTotal++;
-            }
-            var lScore = lTotal > 0 ? lMatch / lTotal : 0;
-            var tScore = tTotal > 0 ? tMatch / tTotal : 0;
-            var score = lScore * 0.6 + tScore * 0.4;
-            if (score < bestScore) continue;
-            // 本命候補: サンプリング→復号
-            var dmMat = [];
-            for (var rr = 0; rr < N; rr++) {
-                var row = new Array(N);
-                for (var cc = 0; cc < N; cc++) {
-                    var p2 = dmd.applyTransform(H, cc + 0.5, rr + 0.5);
-                    row[cc] = luma(p2[0], p2[1]) < threshold;
-                }
-                dmMat.push(row);
-            }
-            var decoded;
-            try {
-                decoded = dmd.decodeFromMatrix(dmMat, decodeOpts);
-            } catch (e) { continue; }
+            var sample = sampleQRMatrixDataMatrix(imageData, width, height, qr, sizes[i]);
+            if (!sample) continue;
+            var decoded = decodeDataMatrixCells(sample.cells, {
+                appEncMask: options.appEncMask,
+                minFinderScore: options.minFinderScore || 0.58
+            });
             if (!decoded) continue;
-            decoded.detectScore = score;
-            decoded.NDM = N;
-            bestScore = score;
-            bestResult = decoded;
-            if ((decoded.rsFailedBlocks || 0) === 0 && decoded.data != null) break;
+            decoded.sample = {
+                threshold: sample.threshold,
+                qrDimension: sample.qrDimension,
+                dmOrigin: sample.dmOrigin
+            };
+            if (!decoded.isRaw) return decoded;
+            if (!bestRaw || (decoded.finderScore || 0) > (bestRaw.finderScore || 0)) bestRaw = decoded;
         }
-        if (!bestResult) return null;
-        return wrapDecodedDM(bestResult, 0, minScore);
+        return bestRaw;
     }
 
-    jsQRFn.decodeQRMatrix = decodeQRMatrix;
-    jsQRFn.decodeDataMatrixFromQuad = decodeDataMatrixFromQuad;
-    if (browserJsQR) {
-        globalObj.jsQR.decodeQRMatrix = decodeQRMatrix;
-        globalObj.jsQR.decodeDataMatrixFromQuad = decodeDataMatrixFromQuad;
+    api.decodeDataMatrixCells = decodeDataMatrixCells;
+    api.decodeDataMatrixFromQuad = decodeDataMatrixFromQuad;
+    api.decodeQRMatrix = decodeQRMatrix;
+    api.sampleQRMatrixDataMatrix = sampleQRMatrixDataMatrix;
+    api.sampleDataMatrixFromQuad = sampleDataMatrixFromQuad;
+    api.scoreDataMatrixFinder = scoreDataMatrixFinder;
+    api.QR_MATRIX_DM_SYMBOLS = DM_SYMBOLS.slice(0);
+
+    if (typeof module !== "undefined" && module.exports && module.exports.default) {
+        module.exports.default = api;
     }
-})(typeof window !== 'undefined' ? window : (typeof self !== 'undefined' ? self : (typeof global !== 'undefined' ? global : this)));
+})(typeof self !== "undefined" ? self : (typeof global !== "undefined" ? global : this));
+
+
 

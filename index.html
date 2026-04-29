@@ -3873,25 +3873,6 @@
             if (!dmResult) {
                 if (bestRaw && bestRaw.finderScore) {
                     matrixLastFinderScore = bestRaw.finderScore;
-                    // DM finder が十分見えているのに RS 訂正に失敗 = ユーザ暗号化の強いシグナル
-                    //   - isRaw (jsQR.decodeQRMatrix の復号失敗)
-                    //   - rsFailedBlocks > 0 (RS ブロックが訂正不可)
-                    // のいずれかが該当し、finderScore が高い場合は暗号化と判定する。
-                    const rsFailed = !!bestRaw.isRaw || (bestRaw.rsFailedBlocks || 0) > 0;
-                    const strongFinder = bestRaw.finderScore >= 0.80;
-                    if (scanMode === 'matrix_normal' && rsFailed && strongFinder) {
-                        if (!appMask) {
-                            matrixRawHitCount = 0;
-                            showPasswordScreen('QR Matrix Data Matrix', 'QR Matrix user encryption password required');
-                            return true;
-                        }
-                        // appMask 設定済みなのに decode 失敗 → パスワード不一致
-                        appMask = null;
-                        matrixRawHitCount = 0;
-                        showPasswordScreen('QR Matrix Data Matrix', 'Password mismatch. Please re-enter.');
-                        return true;
-                    }
-                    // 古い hit-count 判定も一応残す (finder が不安定な場合の保険)
                     if (bestRaw.finderScore >= 0.82) matrixRawHitCount++;
                     if (scanMode === 'matrix_normal' && !appMask && matrixRawHitCount >= 4) {
                         matrixRawHitCount = 0;
